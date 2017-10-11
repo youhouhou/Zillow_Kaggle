@@ -39,12 +39,68 @@ from sklearn.preprocessing import Imputer
 
 #Load data#
 load_s_t = time.time()
+
 train_2017 = pd.read_csv('train_2017.csv',parse_dates = ["transactiondate"])
 train_2016 = pd.read_csv('train_2016_v2.csv',parse_dates = ["transactiondate"])
 frames = [train_2016,train_2017]
 train = pd.concat(frames)
+del train_2017
+del train_2016
+gc.collect()
+
 properties = pd.read_csv('properties_2016.csv')
+
+####preprocessing for properties###
+for c, dtype in zip(properties.columns, properties.dtypes):
+    if dtype == np.float64:
+        properties[c] = properties[c].astype(np.float32)
+
+for c in properties.columns:
+    properties[c]=properties[c].fillna(-1)
+    if properties[c].dtype == 'object':
+        lbl = LabelEncoder()
+        lbl.fit(list(properties[c].values))
+        properties[c] = lbl.transform(list(properties[c].values))
+
+
+
 print('loading data -- %s seconds--' % (time.time()- load_s_t))
+
+
+#####feature selection!####
+def change_date(df):
+    df["transaction_month"] = df["transactiondate"].dt.month
+    df.drop(["transactiondate"], inplace=True, axis=1)
+    return df
+
+train = change_date(train)
+train = train.merge(properties, how='left', on='parcelid')
+#eliminate properties who have too much missing values
+missing_perc_thresh = 0.97
+exclude_missing = []
+num_rows = train.shape[0]
+for c in train.columns:
+    num_missing = train[c].isnull().sum()
+    missing_ratio = num_missing / num_rows
+    if missing_ratio > missing_perc_thresh:
+        exclude_missing.append(c)
+#eliminate properties that has only one value
+exclude_unique = []
+for c in train.columns:
+    num_unique = len(train[c].unique())
+    if train[c].isnull().sum() != 0:
+        num_unique -= 1 # eliminate NaN as a type
+    if num_unique == 1:
+        exclude_unique.append(c)
+#define training feature
+exclude_other = ['parcelid', 'logerror','propertyzoningdesc']
+train_features = []
+for c in train.columns:
+    if c not in exclude_missing \
+       and c not in exclude_other and c not in exclude_unique:
+        train_features.append(c)
+
+
 
 ################
 ################
@@ -54,16 +110,10 @@ print('loading data -- %s seconds--' % (time.time()- load_s_t))
 
 
 print( "\nProcessing data for LightGBM ..." )
-for c, dtype in zip(properties.columns, properties.dtypes):
-    if dtype == np.float64:
-        properties[c] = properties[c].astype(np.float32)
 
-df_train = train.merge(properties, how='left', on='parcelid')
-df_train.fillna(df_train.median(),inplace = True)
-
-x_train = df_train.drop(['parcelid', 'logerror', 'transactiondate', 'propertyzoningdesc',
-                         'propertycountylandusecode', 'fireplacecnt', 'fireplaceflag'], axis=1)
-y_train = df_train['logerror'].values
+x_train = train.loc[:,train_features]
+x_train.fillna(x_train.median(),inplace = True)
+y_train = train['logerror'].values
 print(x_train.shape, y_train.shape)
 
 train_columns = x_train.columns
@@ -71,7 +121,6 @@ train_columns = x_train.columns
 for c in x_train.dtypes[x_train.dtypes == object].index.values:
     x_train[c] = (x_train[c] == True)
 
-del df_train; gc.collect()
 
 x_train = x_train.values.astype(np.float32, copy=False)
 d_train = lgb.Dataset(x_train, label=y_train)
@@ -109,12 +158,13 @@ print("   Read sample file ...")
 sample = pd.read_csv('sample_submission.csv')
 print("   ...")
 sample['parcelid'] = sample['ParcelId']
+sample["transactiondate"] = pd.to_datetime('2016-11-15') # put dummy date in sample data
+sample = change_date(sample)
 print("   Merge with property data ...")
 df_test = sample.merge(properties, on='parcelid', how='left')
 print("   ...")
-del sample, properties; gc.collect()
+del sample; gc.collect()
 print("   ...")
-#df_test['Ratio_1'] = df_test['taxvaluedollarcnt']/df_test['taxamount']
 x_test = df_test[train_columns]
 print("   ...")
 del df_test; gc.collect()
@@ -140,39 +190,26 @@ print( pd.DataFrame(p_test).head() )
 ################
 ################
 
-print( "\nRe-reading properties file ...")
-properties = pd.read_csv('properties_2016.csv')
-
 ##### PROCESS DATA FOR XGBOOST
 
 print( "\nProcessing data for XGBoost ...")
-for c in properties.columns:
-    properties[c]=properties[c].fillna(-1)
-    if properties[c].dtype == 'object':
-        lbl = LabelEncoder()
-        lbl.fit(list(properties[c].values))
-        properties[c] = lbl.transform(list(properties[c].values))
-
-train_df = train.merge(properties, how='left', on='parcelid')
-dup_entry = train_df['parcelid'].value_counts().reset_index() #parcelid that been traded twice
-dup_id = dup_entry.loc[dup_entry.iloc[:,1]>1]
-train_df = train_df.drop(['transactiondate'],axis = 1)
-for id in dup_id.iloc[0]:
-    train_df['parcelid'] = train_df.loc[train_df['parcelid']==id,'logerror'].sum()/(train_df['parcelid']==id).sum()
-x_test = properties.drop(['parcelid'], axis=1)
-
-
-# drop out ouliers
-train_df=train_df[ train_df.logerror > -0.4 ]
-train_df=train_df[ train_df.logerror < 0.419 ]
-train_df = train_df.drop_duplicates()
-x_train = train_df.drop(['parcelid', 'logerror'], axis=1)
-print('Shape train: {}\nShape test: {}'.format(x_train.shape, x_test.shape))
-y_train = train_df["logerror"].values.astype(np.float32)
+#remove out liers
+train_df=train[train.logerror > -0.4]
+train_df=train[train.logerror < 0.419]
+x_train = train_df.loc[:,train_features]
+y_train = train_df["logerror"].values
 y_mean = np.mean(y_train)
 
-print('After removing outliers:')
-print('Shape train: {}\nShape test: {}'.format(x_train.shape, x_test.shape))
+train_columns = x_train.columns
+
+sample = pd.read_csv('sample_submission.csv')
+sample['parcelid'] = sample['ParcelId']
+sample["transactiondate"] = pd.to_datetime('2016-11-15')
+sample = change_date(sample)
+df_test = sample.merge(properties, on='parcelid', how='left')
+del sample; gc.collect()
+
+x_test = df_test[train_columns]
 
 ##### RUN XGBOOST
 
@@ -249,7 +286,6 @@ print( pd.DataFrame(xgb_pred).head() )
 del train_df
 del x_train
 del x_test
-del properties
 del dtest
 del dtrain
 del xgb_pred1
@@ -265,38 +301,13 @@ gc.collect()
 # Read in data for neural network
 print( "\n\nProcessing data for Neural Network ...")
 print('\nLoading train, prop and sample data...')
-train_2017 = pd.read_csv('train_2017.csv',parse_dates = ["transactiondate"])
-train_2016 = pd.read_csv('train_2016_v2.csv',parse_dates = ["transactiondate"])
-frames = [train_2016,train_2017]
-train = pd.concat(frames)
-prop = pd.read_csv('properties_2016.csv')
 sample = pd.read_csv('sample_submission.csv')
-
-print('Fitting Label Encoder on properties...')
-for c in prop.columns:
-    prop[c]=prop[c].fillna(-1)
-    if prop[c].dtype == 'object':
-        lbl = LabelEncoder()
-        lbl.fit(list(prop[c].values))
-        prop[c] = lbl.transform(list(prop[c].values))
-
-
-print('Creating training set...')
-df_train = train.merge(prop, how='left', on='parcelid')
-
-df_train["transactiondate"] = pd.to_datetime(df_train["transactiondate"])
-df_train["transactiondate_year"] = df_train["transactiondate"].dt.year
-df_train["transactiondate_month"] = df_train["transactiondate"].dt.month
-df_train['transactiondate_quarter'] = df_train['transactiondate'].dt.quarter
-df_train["transactiondate"] = df_train["transactiondate"].dt.day
-
-
-print('Filling NA/NaN values...' )
-df_train.fillna(-1.0)
+sample["transactiondate"] = pd.to_datetime('2016-11-15')
+sample = change_date(sample)
 
 print('Creating x_train and y_train from df_train...' )
-x_train = df_train.drop(['parcelid', 'logerror', 'transactiondate', 'propertyzoningdesc', 'propertycountylandusecode','fireplacecnt', 'fireplaceflag'], axis=1)
-y_train = df_train["logerror"]
+x_train = train.loc[:,train_features]
+y_train = train["logerror"]
 y_mean = np.mean(y_train)
 print(x_train.shape, y_train.shape)
 train_columns = x_train.columns
@@ -307,15 +318,10 @@ for c in x_train.dtypes[x_train.dtypes == object].index.values:
 
 print('Creating df_test...')
 sample['parcelid'] = sample['ParcelId']
-
+sample["transactiondate"] = pd.to_datetime('2016-11-15')
+sample = change_date(sample)
 print("Merging Sample with property data...")
-df_test = sample.merge(prop, on='parcelid', how='left')
-
-df_test["transactiondate"] = pd.to_datetime('2016-11-15')  # placeholder value for preliminary version
-df_test["transactiondate_year"] = df_test["transactiondate"].dt.year
-df_test["transactiondate_month"] = df_test["transactiondate"].dt.month
-df_test['transactiondate_quarter'] = df_test['transactiondate'].dt.quarter
-df_test["transactiondate"] = df_test["transactiondate"].dt.day
+df_test = sample.merge(properties, on='parcelid', how='left')
 x_test = df_test[train_columns]
 
 print('Shape of x_test:', x_test.shape)
@@ -375,8 +381,6 @@ print( "Type of nn_pred is ", type(nn_pred) )
 print( "Shape of nn_pred is ", nn_pred.shape )
 
 # Cleanup
-del train
-del prop
 del sample
 del x_train
 del x_test
@@ -395,45 +399,38 @@ np.random.seed(17)
 random.seed(17)
 
 print( "\n\nProcessing data for OLS ...")
+sample = pd.read_csv("sample_submission.csv")
+sample['parcelid'] = sample['ParcelId']
+sample["transactiondate"] = pd.to_datetime('2016-11-15')
+sample = change_date(sample)
 
-train_2017 = pd.read_csv('train_2017.csv',parse_dates = ["transactiondate"])
-train_2016 = pd.read_csv('train_2016_v2.csv',parse_dates = ["transactiondate"])
-frames = [train_2016,train_2017]
-train = pd.concat(frames)
-properties = pd.read_csv("properties_2016.csv")
-submission = pd.read_csv("sample_submission.csv")
+x_train = trian[train_features]
+y = train['logerror'].values
 
+train_columns = train.columns
 
-def get_features(df):
-    df["transactiondate"] = pd.to_datetime(df["transactiondate"])
-    df["transactiondate_year"] = df["transactiondate"].dt.year
-    df["transactiondate_month"] = df["transactiondate"].dt.month
-    df['transactiondate'] = df['transactiondate'].dt.quarter
-    df = df.fillna(-1.0)
-    return df
+print("Merging Sample with property data...")
+df_test = sample.merge(properties, on='parcelid', how='left')
+x_test = df_test[train_columns]
 
 def MAE(y, ypred):
     #logerror=log(Zestimate)−log(SalePrice)
     return np.sum([abs(y[i]-ypred[i]) for i in range(len(y))]) / len(y)
 
-
-train = pd.merge(train, properties, how='left', on='parcelid')
-y = train['logerror'].values
-test = pd.merge(submission, properties, how='left', left_on='ParcelId', right_on='parcelid')
 properties = [] #memory
-
-exc = [train.columns[c] for c in range(len(train.columns)) if train.dtypes[c] == 'O'] + ['logerror','parcelid']
-col = [c for c in train.columns if c not in exc]
-
-train = get_features(train[col])
-test['transactiondate'] = '2016-01-01' #should use the most common training date
-test = get_features(test[col])
 
 print("\nFitting OLS...")
 reg = LinearRegression(n_jobs=-1)
-reg.fit(train, y); print('fit...')
-print(MAE(y, reg.predict(train)))
+reg.fit(x_train, y); print('fit...')
+print(MAE(y, reg.predict(x_train)))
 train = [];  y = [] #memory
+
+del sample
+del properties
+del train
+del x_train
+del x_test
+gc.collect()
 
 test_dates = ['2016-10-01','2016-11-01','2016-12-01','2017-10-01','2017-11-01','2017-12-01']
 test_columns = ['201610','201611','201612','201710','201711','201712']
